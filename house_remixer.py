@@ -4,8 +4,9 @@ House Remixer - trasforma una canzone in un remix house.
 
 Pipeline:
   1. carica l'audio (WAV nativo, qualsiasi altro formato tramite ffmpeg)
-  2. rileva BPM, griglia dei beat, primo downbeat e tonalita'
-  3. porta il brano al BPM house scelto (phase vocoder: la tonalita' non cambia)
+  2. rileva ogni singolo beat (anche se il tempo varia), il primo downbeat e la tonalita'
+  3. porta il brano al BPM house scelto allineando ogni beat alla griglia
+     (phase vocoder con mappa temporale variabile: la tonalita' non cambia)
   4. analizza la nota di basso di ogni battuta per far seguire al nuovo basso
      l'armonia originale
   5. arrangia un remix (intro, build, drop, break, build, drop, outro) con
@@ -128,17 +129,24 @@ def save_audio(path: str, x: np.ndarray, sr: int = SR) -> None:
 # DSP di base (tutto vettorizzato con numpy)
 # ---------------------------------------------------------------------------
 
-def time_stretch(x: np.ndarray, rate: float, n_fft: int = 2048, hop: int = 512) -> np.ndarray:
-    """Phase vocoder stereo-coerente. rate > 1 = piu' veloce. Il pitch non cambia."""
-    if abs(rate - 1.0) < 1e-4:
-        return x.copy()
+def warp_stretch(x: np.ndarray, out_to_in, n_out: int, n_fft: int = 2048, hop: int = 256) -> np.ndarray:
+    """Phase vocoder stereo-coerente con mappa temporale arbitraria.
+
+    out_to_in: funzione vettoriale che converte un campione di uscita nel
+    corrispondente campione di ingresso (monotona). Permette sia lo stretch
+    uniforme sia il "warping" beat per beat. Il pitch non cambia.
+    """
     win = np.hanning(n_fft)
+    half = n_fft // 2
     pad = n_fft
-    xp = np.pad(x, ((pad, pad + n_fft), (0, 0)))
-    n_frames = (len(xp) - n_fft) // hop
-    steps = np.arange(0, n_frames - 1, rate)
+    xp = np.pad(x, ((pad, pad + 2 * n_fft), (0, 0)))
+    max_k = (len(xp) - n_fft) // hop - 1
+    # centri dei frame in uscita -> posizione (in frame) dei centri in ingresso
+    centers_out = np.arange(-2 * hop, n_out + 2 * hop, hop)
+    centers_in = np.asarray(out_to_in(centers_out.astype(float)), dtype=float)
+    steps = np.clip((centers_in + pad - half) / hop, 0, max_k - 1e-6)
     omega = 2 * np.pi * hop * np.arange(n_fft // 2 + 1) / n_fft
-    y = np.zeros((len(steps) * hop + n_fft, 2))
+    y = np.zeros((n_out + 2 * pad + n_fft, 2))
     wsum = np.zeros(len(y))
     cache: dict[int, np.ndarray] = {}
 
@@ -151,27 +159,40 @@ def time_stretch(x: np.ndarray, rate: float, n_fft: int = 2048, hop: int = 512) 
         return cache[k]
 
     phase = None
-    for i, s in enumerate(steps):
+    prev_e = None
+    hf_lo = n_fft // 64  # ignora i bin sotto ~350 Hz nel rilevare i transienti
+    for i, (c, s) in enumerate(zip(centers_out, steps)):
         k = int(s)
         a = s - k
         f0, f1 = frame(k), frame(k + 1)
         mid0, mid1 = f0.sum(0), f1.sum(0)
-        if phase is None:
+        # transiente (attacco di cassa, rullante...): riparti dalla fase originale
+        # cosi' l'attacco resta netto e nella posizione giusta
+        e0 = float(np.sum(np.abs(mid0[hf_lo:]) ** 2))
+        is_onset = prev_e is not None and e0 > 2.0 * prev_e + 1e-9
+        prev_e = 0.7 * (prev_e or e0) + 0.3 * e0
+        if phase is None or is_onset:
             phase = np.angle(mid0)
         mag = (1 - a) * np.abs(f0) + a * np.abs(f1)
         # conserva la differenza di fase L/R rispetto al canale mid -> immagine stereo stabile
         rel = np.angle(f0) - np.angle(mid0)[None, :]
         Y = mag * np.exp(1j * (phase[None, :] + rel))
         out = np.fft.irfft(Y, n=n_fft, axis=1) * win
-        y[i * hop:i * hop + n_fft] += out.T
-        wsum[i * hop:i * hop + n_fft] += win ** 2
+        o = c - half + pad
+        y[o:o + n_fft] += out.T
+        wsum[o:o + n_fft] += win ** 2
         dp = np.angle(mid1) - np.angle(mid0) - omega
         dp -= 2 * np.pi * np.round(dp / (2 * np.pi))
         phase = phase + omega + dp
     y /= np.maximum(wsum, 1e-3)[:, None]
-    start = int(round(pad / rate))
-    length = int(round(len(x) / rate))
-    return y[start:start + length]
+    return y[pad:pad + n_out]
+
+
+def time_stretch(x: np.ndarray, rate: float, n_fft: int = 2048, hop: int = 256) -> np.ndarray:
+    """Stretch uniforme. rate > 1 = piu' veloce."""
+    if abs(rate - 1.0) < 1e-4:
+        return x.copy()
+    return warp_stretch(x, lambda o: o * rate, int(round(len(x) / rate)), n_fft, hop)
 
 
 def pitch_shift(x: np.ndarray, semitones: float) -> np.ndarray:
@@ -323,23 +344,116 @@ def _comb(env: np.ndarray, fps: float, bpm: float, nbins: int):
     return h[j], (j + 0.5) / nbins * period / fps
 
 
-def detect_beats(x: np.ndarray, sr: int, lo=60.0, hi=190.0, bpm_override=None):
-    """Restituisce (bpm, secondi del primo downbeat)."""
+def _onsets(x: np.ndarray, sr: int):
+    """Envelope degli attacchi. Restituisce (env, flux, flux_low, fps, bias_s)."""
     sig, sra = _analysis_signal(x, sr)
-    hop = 128
-    M = magnitude_spectrogram(sig, 1024, hop)
+    n_fft, hop = 1024, 128
+    M = magnitude_spectrogram(sig, n_fft, hop)
     fps = sra / hop
     L = np.log1p(10 * M)
     d = np.maximum(0, np.diff(L, axis=0))
-    freqs = np.fft.rfftfreq(1024, 1 / sra)
+    freqs = np.fft.rfftfreq(n_fft, 1 / sra)
     flux = np.concatenate([[0], d.sum(1)])
     flux_low = np.concatenate([[0], d[:, freqs < 150].sum(1)])
     k = max(1, int(fps * 0.5))
     env = np.maximum(0, flux - np.convolve(flux, np.ones(k) / k, "same"))
+    # la finestra di Hann "vede" l'attacco ~n_fft/4 campioni in anticipo
+    return env, flux, flux_low, fps, n_fft / 4 / sra
 
-    if bpm_override:
-        bpm = float(bpm_override)
+
+def _dp_beats(env: np.ndarray, period: float, tightness: float = 300.0) -> np.ndarray:
+    """Beat tracking a programmazione dinamica (stile Ellis 2007). Ritorna frame (float)."""
+    o = env / (env.std() + 1e-9)
+    n = len(o)
+    offs = np.arange(max(1, int(round(period / 2))), int(round(period * 2)) + 1)
+    pen = -tightness * np.log(offs / period) ** 2
+    C = o.astype(float).copy()
+    back = -np.ones(n, dtype=int)
+    for t in range(offs[0], n):
+        cand = t - offs
+        v = cand >= 0
+        sc = C[cand[v]] + pen[v]
+        j = int(np.argmax(sc))
+        C[t] = o[t] + sc[j]
+        back[t] = cand[v][j]
+    tail = max(1, int(period))
+    t = n - tail + int(np.argmax(C[n - tail:]))
+    beats = []
+    while t >= 0:
+        beats.append(t)
+        t = back[t]
+    beats = np.array(beats[::-1], dtype=float)
+    # raffinamento sub-frame: picco parabolico dell'envelope vicino al beat
+    for i, b in enumerate(beats):
+        b = int(b)
+        lo, hi = max(1, b - 2), min(n - 2, b + 2)
+        if hi <= lo:
+            continue
+        p = lo + int(np.argmax(env[lo:hi + 1]))
+        y0, y1, y2 = env[p - 1], env[p], env[p + 1]
+        den = y0 - 2 * y1 + y2
+        beats[i] = p + (0.5 * (y0 - y2) / den if den < 0 else 0.0)
+    return beats
+
+
+def track_beats(x: np.ndarray, sr: int, bpm_override=None, shift_beats: int = 0):
+    """Trova ogni beat del brano.
+
+    Restituisce (tempi dei beat in secondi, indice del primo downbeat, bpm medio, rigido)
+    dove `rigido` indica un tempo costante (brano quantizzato/elettronico).
+    """
+    env, flux, flux_low, fps, bias = _onsets(x, sr)
+    bpm0 = float(bpm_override) if bpm_override else estimate_tempo(env, fps)
+    frames = _dp_beats(env, fps * 60.0 / bpm0)
+    if len(frames) < 8:
+        raise SystemExit("Non trovo abbastanza beat: il brano e' troppo corto o senza ritmo.")
+    times = frames / fps + bias
+    idx = np.arange(len(times))
+    # affidabilita': i beat senza un attacco chiaro (pad, voce, intro senza
+    # batteria) non sono precisi e vengono ricavati dai vicini affidabili
+    fr0 = np.clip(np.round(frames).astype(int), 0, len(env) - 1)
+    strength = np.array([env[max(0, f - 2):f + 3].max() for f in fr0])
+    good = strength > 0.35 * np.median(strength)
+    if good.sum() < 8:
+        good[:] = True
+    slope, icpt = np.polyfit(idx[good], times[good], 1)
+    resid = times - (slope * idx + icpt)
+    r_good = resid[good]
+    mad = 1.4826 * float(np.median(np.abs(r_good - np.median(r_good))))
+    # deriva lenta (es. 1 BPM in piu' a fine brano) = tempo variabile anche con MAD bassa
+    drift = np.convolve(r_good, np.ones(16) / 16, "valid") if len(r_good) > 16 else r_good
+    rigid = mad < 0.008 and float(np.abs(drift).max()) < 0.012
+    if rigid:
+        # tempo costante: griglia perfetta (aggancia ai BPM interi se vicinissimi)
+        bpm = 60.0 / slope
+        if abs(bpm - round(bpm)) < 0.03:
+            slope = 60.0 / round(bpm)
+            icpt = float(np.mean(times - slope * idx))
+        times = slope * idx + icpt
     else:
+        # tempo variabile: segue la deriva, elimina il jitter del rilevamento
+        resid = np.interp(idx, idx[good], resid[good])
+        k = 3
+        sm = np.convolve(np.pad(resid, k // 2, mode="edge"), np.ones(k) / k, "valid")
+        times = slope * idx + icpt + sm
+        times = np.maximum.accumulate(times)
+    bpm = 60.0 / float(np.median(np.diff(times)))
+
+    # downbeat: quale dei 4 beat della battuta ha piu' energia (basse + totale)
+    tot = flux / (flux.max() + 1e-9) + 2 * flux_low / (flux_low.max() + 1e-9)
+    fr = np.clip(np.round((times - bias) * fps).astype(int), 0, len(tot) - 1)
+    best_j, best_s = 0, -1.0
+    for j in range(4):
+        s = float(tot[fr[j::4]].mean())
+        if s > best_s * 1.02:  # a parita', preferisci il primo beat
+            best_j, best_s = j, s
+    jd = (best_j + shift_beats) % 4
+    return times, jd, bpm, rigid
+
+
+def estimate_tempo(env: np.ndarray, fps: float, lo=60.0, hi=190.0) -> float:
+    """BPM globale con filtro a pettine."""
+    if len(env) > 0:
         grid = np.arange(lo, hi + 1e-9, 0.2)
         scores = [_comb(env, fps, b, 32)[0] for b in grid]
         coarse = grid[int(np.argmax(scores))]
@@ -356,22 +470,27 @@ def detect_beats(x: np.ndarray, sr: int, lo=60.0, hi=190.0, bpm_override=None):
         r = round(bpm)
         if abs(r - bpm) < 0.15 and _comb(env, fps, r, 64)[0] >= 0.97 * fs.max():
             bpm = float(r)
-    _, phase = _comb(env, fps, bpm, 64)
-    beat = 60.0 / bpm
-    # la finestra di Hann "vede" l'attacco ~n_fft/4 campioni in anticipo: compensa
-    phase = (phase + 1024 / 4 / sra) % beat
+        return bpm
+    return 120.0
 
-    # downbeat: quale dei 4 beat della battuta ha piu' energia (basse + totale)
-    n_beats = int((len(env) / fps - phase) / beat)
-    best_j, best_s = 0, -1.0
-    tot = flux / (flux.max() + 1e-9) + 2 * flux_low / (flux_low.max() + 1e-9)
-    for j in range(4):
-        idx = np.round((phase + (np.arange(j, n_beats, 4)) * beat) * fps).astype(int)
-        idx = idx[idx < len(tot)]
-        s = float(tot[idx].mean()) if len(idx) else 0
-        if s > best_s * 1.02:  # a parita', preferisci il primo beat
-            best_j, best_s = j, s
-    return bpm, phase + best_j * beat
+
+def beat_warp_map(beats: np.ndarray, jd: int, target_bpm: float, dur_s: float, sr: int):
+    """Mappa uscita->ingresso che mette ogni beat del brano esattamente sulla griglia.
+
+    Restituisce (funzione out_to_in in campioni, campioni in uscita, secondi del primo downbeat).
+    """
+    T = 60.0 / target_bpm
+    p0 = float(np.median(np.diff(beats[:9])))
+    p1 = float(np.median(np.diff(beats[-9:])))
+    g0 = beats[0] * T / p0  # la parte prima del primo beat segue il tempo locale
+    G = g0 + np.arange(len(beats)) * T
+    B = beats.copy()
+    if B[0] > 0:
+        G, B = np.concatenate([[0.0], G]), np.concatenate([[0.0], B])
+    tail_out = G[-1] + max(0.0, dur_s - B[-1]) * T / p1
+    G, B = np.concatenate([G, [tail_out]]), np.concatenate([B, [max(dur_s, B[-1] + 1e-3)]])
+    out_to_in = lambda o: np.interp(o / sr, G, B) * sr  # noqa: E731
+    return out_to_in, int(round(tail_out * sr)), g0 + jd * T
 
 
 def harmonic_analysis(x: np.ndarray, sr: int, offset: float, bar_len: float, n_bars: int):
@@ -892,19 +1011,21 @@ def main(argv=None):
     log(f"  durata {len(x) / SR:.1f}s")
 
     log("Analisi del ritmo ...")
-    src_bpm, downbeat = detect_beats(x, SR, bpm_override=a.source_bpm)
-    downbeat += a.shift_beats * 60.0 / src_bpm
-    downbeat %= 4 * 60.0 / src_bpm
-    log(f"  BPM originale ~ {src_bpm:.2f}, primo downbeat a {downbeat:.3f}s")
+    beats, jd, src_bpm, rigid = track_beats(x, SR, a.source_bpm, a.shift_beats)
+    if rigid:
+        log(f"  tempo costante ~ {src_bpm:.2f} BPM, {len(beats)} beat, "
+            f"primo downbeat a {beats[jd]:.3f}s")
+    else:
+        bpms = 60.0 / np.diff(beats)
+        log(f"  tempo variabile {np.percentile(bpms, 5):.1f}-{np.percentile(bpms, 95):.1f} BPM "
+            f"(media {src_bpm:.1f}), {len(beats)} beat: allineo beat per beat")
 
-    rate = target_bpm / src_bpm
-    if abs(rate - 1) > 1e-4:
-        log(f"Time-stretch {src_bpm:.2f} -> {target_bpm:.2f} BPM (x{rate:.3f}) ...")
-    song = time_stretch(x, rate)
+    log(f"Time-stretch -> {target_bpm:g} BPM (griglia fissa) ...")
+    out_to_in, n_out, offset = beat_warp_map(beats, jd, target_bpm, len(x) / SR, SR)
+    song = warp_stretch(x, out_to_in, n_out)
     if a.semitones:
         log(f"Trasposizione di {a.semitones:+g} semitoni ...")
         song = pitch_shift(song, a.semitones)
-    offset = downbeat / rate
     bar_s = 4 * 60.0 / target_bpm * SR
     n_src = int((len(song) - offset * SR) // bar_s)
     if n_src < 1:

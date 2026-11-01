@@ -51,10 +51,16 @@ python3 house_remixer.py canzone.mp3 -p deep --bpm 122 -o remix.mp3 --stems stem
 
 ## Come funziona
 
-1. **Beat tracking**: flusso spettrale, poi un filtro a pettine su 60–190 BPM con
-   affinamento a 0.01 BPM, quindi la fase del beat e la scelta del downbeat.
-2. **Time-stretch**: phase vocoder stereo-coerente, che cambia il tempo senza cambiare
-   la tonalità.
+1. **Beat tracking**: flusso spettrale, stima del tempo con un filtro a pettine
+   (60–190 BPM), poi un tracking di **ogni singolo beat** con programmazione dinamica.
+   Se il brano ha un tempo costante (musica elettronica, brani quantizzati) usa una
+   griglia perfetta. Se il tempo varia (band dal vivo, brani suonati a mano) segue la
+   deriva beat per beat. I beat senza un attacco chiaro (intro senza batteria, pad)
+   vengono ricavati dai vicini affidabili.
+2. **Time-stretch con warping**: phase vocoder stereo-coerente con mappa temporale
+   variabile. Ogni beat del brano finisce esattamente sulla griglia del remix e la
+   tonalità non cambia. Il reset di fase sui transienti mantiene gli attacchi netti e
+   a tempo (errore tipico sotto i 2 ms).
 3. **Armonia**: chromagram con profili di Krumhansl per la tonalità, e analisi della
    banda bassa battuta per battuta. Il nuovo basso e gli accordi seguono così le note
    della canzone.
